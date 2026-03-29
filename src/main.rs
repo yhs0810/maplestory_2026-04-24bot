@@ -43,10 +43,10 @@ async fn main() {
     // 데이터베이스 접속 정보 (서버 아이피, 관리자 root, 비밀번호, root 로컬 포트 3306)
     // 이 프로그램은 리눅스 서버 내부에서 실행되므로, 127.0.0.1 로컬호스트로 MySQL에 바로 접근하는 것이 가장 안전하고 빠릅니다.
     // 만약 사장님 윈도우 PC에서 테스트하신다면 127.0.0.1 부분을 93.127.129.57 로 바꿔서 실행하세요.
-    let db_url = "mysql://root:a102331253910!@127.0.0.1:3306/maplestory_bot";
+    let db_url = "mysql://user_account:Aa102331253910!@127.0.0.1:3306/maplestory_bot";
 
     let pool = MySqlPoolOptions::new()
-        .max_connections(10) // 서버가 동시에 처리할 수 있는 DB 커넥션 최대 개수
+        .max_connections(100) // 서버가 동시에 처리할 수 있는 DB 커넥션 최대 개수
         .connect(db_url)
         .await
         .expect("Failed to connect to MySQL! DB 서버가 켜져있는지 비밀번호가 맞는지 확인하세요.");
