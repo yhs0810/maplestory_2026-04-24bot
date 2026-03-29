@@ -261,16 +261,10 @@ async fn add_user_handler(
     let expire_date = current_time + chrono::Duration::days(days as i64);
     let expire_str = expire_date.naive_local();
 
-    // SQL 실행: 이미 존재하면 기간 연장 및 정보 업데이트
+    // SQL 실행: 새로 추가만 허용 (이미 있으면 에러 발생)
     let query = "
         INSERT INTO users (user_id, expire_date, who_added, Discord_tele_id, is_login, last_ping)
         VALUES (?, ?, ?, ?, 0, NOW())
-        ON DUPLICATE KEY UPDATE 
-            expire_date = VALUES(expire_date),
-            who_added = VALUES(who_added),
-            Discord_tele_id = VALUES(Discord_tele_id),
-            is_login = 0,
-            last_ping = NOW()
     ";
 
     let res = sqlx::query(query)
@@ -284,13 +278,20 @@ async fn add_user_handler(
     match res {
         Ok(_) => Json(AddUserResponse {
             status: "ok".to_string(),
-            message: format!("성공적으로 추가/갱신되었습니다: {} ({}일)", user_id, days),
+            message: format!("성공적으로 추가되었습니다: {} ({}일)", user_id, days),
         }),
         Err(e) => {
+            let err_msg = e.to_string();
+            let final_msg = if err_msg.contains("Duplicate entry") {
+                format!("실패: '{}'은(는) 이미 존재하는 사용자입니다.", user_id)
+            } else {
+                format!("사용자 추가 실패: {}", e)
+            };
+            
             println!("DB Error (AddUser): {:?}", e);
             Json(AddUserResponse {
                 status: "error".to_string(),
-                message: format!("사용자 추가 실패: {}", e),
+                message: final_msg,
             })
         }
     }
