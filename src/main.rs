@@ -79,9 +79,11 @@ async fn main() {
         .expect("Failed to connect to Seller DB!");
 
     // 데이터베이스 컬럼 자동 추가 (에러는 무시)
-    let _ = sqlx::query("ALTER TABLE users ADD COLUMN auto_lie_last_ping TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
-        .execute(&user_pool)
-        .await;
+    let _ = sqlx::query(
+        "ALTER TABLE users ADD COLUMN auto_lie_last_ping TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+    )
+    .execute(&user_pool)
+    .await;
 
     let state = AppState {
         user_db: user_pool,
