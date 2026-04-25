@@ -104,10 +104,7 @@ async fn main() {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
         loop {
             interval.tick().await;
-            // 프로그램1 (is_login) 정리
-            let _ = sqlx::query("UPDATE users SET is_login = 0 WHERE is_login = 1 AND TIMESTAMPDIFF(SECOND, last_ping, NOW()) > 60")
-                .execute(&cleaner_pool).await;
-            // 프로그램2 (auto_lie_login) 정리
+            // auto_lie_login 정리
             let _ = sqlx::query("UPDATE users SET auto_lie_login = 0 WHERE auto_lie_login = 1 AND TIMESTAMPDIFF(SECOND, last_ping, NOW()) > 60")
                 .execute(&cleaner_pool).await;
         }
@@ -122,19 +119,16 @@ async fn login_handler(
     Json(payload): Json<LoginRequest>,
 ) -> Json<LoginResponse> {
     let user_id = payload.user_id;
-    let is_auto_lie = payload.program.as_deref() == Some("auto_lie");
 
-    let user_res = sqlx::query(
-        "SELECT expire_date, is_login, auto_lie, auto_lie_login FROM users WHERE user_id = ?",
-    )
-    .bind(&user_id)
-    .fetch_optional(&state.user_db)
-    .await;
+    let user_res =
+        sqlx::query("SELECT expire_date, auto_lie, auto_lie_login FROM users WHERE user_id = ?")
+            .bind(&user_id)
+            .fetch_optional(&state.user_db)
+            .await;
 
     match user_res {
         Ok(Some(row)) => {
             let expire_date: chrono::NaiveDateTime = row.get("expire_date");
-            let is_login: i8 = row.get("is_login");
             let auto_lie: i8 = row.try_get("auto_lie").unwrap_or(0);
             let auto_lie_login: i8 = row.try_get("auto_lie_login").unwrap_or(0);
 
@@ -153,54 +147,40 @@ async fn login_handler(
                 });
             }
 
-            if is_auto_lie {
-                // [프로그램2 로직]
-                if auto_lie != 1 {
+            // auto_lie 권한 체크
+            if auto_lie != 1 {
+                return Json(LoginResponse {
+                    status: "error".to_string(),
+                    expire_date: None,
+                    message: Some(format!("사용 권한이 없습니다 (auto_lie: {}).", auto_lie)),
+                });
+            }
+
+            // 중복 로그인 체크 (auto_lie_login 사용)
+            if auto_lie_login != 0 {
+                let diff: i64 = sqlx::query_scalar(
+                    "SELECT TIMESTAMPDIFF(SECOND, last_ping, NOW()) FROM users WHERE user_id = ?",
+                )
+                .bind(&user_id)
+                .fetch_one(&state.user_db)
+                .await
+                .unwrap_or(999);
+                if diff < 30 {
                     return Json(LoginResponse {
                         status: "error".to_string(),
                         expire_date: None,
-                        message: Some(format!("사용 권한이 없습니다 (auto_lie: {}).", auto_lie)),
+                        message: Some("이미 다른 기기에서 사용 중입니다.".to_string()),
                     });
                 }
-                if auto_lie_login != 0 {
-                    let diff: i64 = sqlx::query_scalar("SELECT TIMESTAMPDIFF(SECOND, last_ping, NOW()) FROM users WHERE user_id = ?")
-                        .bind(&user_id).fetch_one(&state.user_db).await.unwrap_or(999);
-                    if diff < 30 {
-                        return Json(LoginResponse {
-                            status: "error".to_string(),
-                            expire_date: None,
-                            message: Some(
-                                "이미 다른 기기(프로그램2)에서 사용 중입니다.".to_string(),
-                            ),
-                        });
-                    }
-                }
-                let _ = sqlx::query(
-                    "UPDATE users SET auto_lie_login = 1, last_ping = NOW() WHERE user_id = ?",
-                )
-                .bind(&user_id)
-                .execute(&state.user_db)
-                .await;
-            } else {
-                // [프로그램1 로직]
-                if is_login != 0 {
-                    let diff: i64 = sqlx::query_scalar("SELECT TIMESTAMPDIFF(SECOND, last_ping, NOW()) FROM users WHERE user_id = ?")
-                        .bind(&user_id).fetch_one(&state.user_db).await.unwrap_or(999);
-                    if diff < 30 {
-                        return Json(LoginResponse {
-                            status: "error".to_string(),
-                            expire_date: None,
-                            message: Some("이미 로그인된 사용자입니다 (프로그램1).".to_string()),
-                        });
-                    }
-                }
-                let _ = sqlx::query(
-                    "UPDATE users SET is_login = 1, last_ping = NOW() WHERE user_id = ?",
-                )
-                .bind(&user_id)
-                .execute(&state.user_db)
-                .await;
             }
+
+            // 로그인 상태 업데이트
+            let _ = sqlx::query(
+                "UPDATE users SET auto_lie_login = 1, last_ping = NOW() WHERE user_id = ?",
+            )
+            .bind(&user_id)
+            .execute(&state.user_db)
+            .await;
 
             return Json(LoginResponse {
                 status: "ok".to_string(),
@@ -226,17 +206,10 @@ async fn logout_handler(
     State(state): State<AppState>,
     Json(payload): Json<BasicRequest>,
 ) -> Json<serde_json::Value> {
-    if payload.program.as_deref() == Some("auto_lie") {
-        let _ = sqlx::query("UPDATE users SET auto_lie_login = 0 WHERE user_id = ?")
-            .bind(payload.user_id)
-            .execute(&state.user_db)
-            .await;
-    } else {
-        let _ = sqlx::query("UPDATE users SET is_login = 0 WHERE user_id = ?")
-            .bind(payload.user_id)
-            .execute(&state.user_db)
-            .await;
-    }
+    let _ = sqlx::query("UPDATE users SET auto_lie_login = 0 WHERE user_id = ?")
+        .bind(payload.user_id)
+        .execute(&state.user_db)
+        .await;
     Json(serde_json::json!({"status": "ok"}))
 }
 
@@ -246,80 +219,44 @@ async fn heartbeat_handler(
     Json(payload): Json<BasicRequest>,
 ) -> Json<HeartbeatResponse> {
     let user_id = payload.user_id;
-    let is_auto_lie = payload.program.as_deref() == Some("auto_lie");
 
-    if is_auto_lie {
-        let _ = sqlx::query(
-            "UPDATE users SET last_ping = NOW() WHERE user_id = ? AND auto_lie_login = 1",
-        )
-        .bind(&user_id)
-        .execute(&state.user_db)
-        .await;
+    // 핑 업데이트
+    let _ =
+        sqlx::query("UPDATE users SET last_ping = NOW() WHERE user_id = ? AND auto_lie_login = 1")
+            .bind(&user_id)
+            .execute(&state.user_db)
+            .await;
 
-        if let Ok(row) =
-            sqlx::query("SELECT auto_lie_login, expire_date, auto_lie FROM users WHERE user_id = ?")
-                .bind(&user_id)
-                .fetch_one(&state.user_db)
-                .await
-        {
-            let auto_lie_login: i8 = row.get("auto_lie_login");
-            let auto_lie: i8 = row.get("auto_lie");
-            let expire_date: chrono::NaiveDateTime = row.get("expire_date");
-
-            if auto_lie == 0 || auto_lie_login == 0 {
-                return Json(HeartbeatResponse {
-                    action: Some("kick".to_string()),
-                });
-            }
-
-            let expire_edmonton = chrono_tz::America::Edmonton
-                .from_local_datetime(&expire_date)
-                .single()
-                .unwrap();
-            if Utc::now().with_timezone(&chrono_tz::America::Edmonton) >= expire_edmonton {
-                let _ = sqlx::query("UPDATE users SET auto_lie_login = 0 WHERE user_id = ?")
-                    .bind(&user_id)
-                    .execute(&state.user_db)
-                    .await;
-                return Json(HeartbeatResponse {
-                    action: Some("kick".to_string()),
-                });
-            }
-        }
-    } else {
-        let _ =
-            sqlx::query("UPDATE users SET last_ping = NOW() WHERE user_id = ? AND is_login = 1")
-                .bind(&user_id)
-                .execute(&state.user_db)
-                .await;
-
-        if let Ok(row) = sqlx::query("SELECT is_login, expire_date FROM users WHERE user_id = ?")
+    if let Ok(row) =
+        sqlx::query("SELECT auto_lie_login, expire_date, auto_lie FROM users WHERE user_id = ?")
             .bind(&user_id)
             .fetch_one(&state.user_db)
             .await
-        {
-            let is_login: i8 = row.get("is_login");
-            let expire_date: chrono::NaiveDateTime = row.get("expire_date");
+    {
+        let auto_lie_login: i8 = row.get("auto_lie_login");
+        let auto_lie: i8 = row.get("auto_lie");
+        let expire_date: chrono::NaiveDateTime = row.get("expire_date");
 
-            if is_login == 0 {
-                return Json(HeartbeatResponse {
-                    action: Some("kick".to_string()),
-                });
-            }
+        // 권한 또는 세션 체크
+        if auto_lie == 0 || auto_lie_login == 0 {
+            return Json(HeartbeatResponse {
+                action: Some("kick".to_string()),
+            });
+        }
 
-            let expire_edmonton = chrono_tz::America::Edmonton
-                .from_local_datetime(&expire_date)
-                .single()
-                .unwrap();
-            if Utc::now().with_timezone(&chrono_tz::America::Edmonton) >= expire_edmonton {
-                let _ = sqlx::query("UPDATE users SET is_login = 0 WHERE user_id = ?")
-                    .bind(&user_id)
-                    .execute(&state.user_db)
-                    .await;
-                return Json(HeartbeatResponse {
-                    action: Some("kick".to_string()),
-                });
-            }
+        // 만료 체크
+        let expire_edmonton = chrono_tz::America::Edmonton
+            .from_local_datetime(&expire_date)
+            .single()
+            .unwrap();
+        if Utc::now().with_timezone(&chrono_tz::America::Edmonton) >= expire_edmonton {
+            let _ = sqlx::query("UPDATE users SET auto_lie_login = 0 WHERE user_id = ?")
+                .bind(&user_id)
+                .execute(&state.user_db)
+                .await;
+            return Json(HeartbeatResponse {
+                action: Some("kick".to_string()),
+            });
         }
     }
     Json(HeartbeatResponse { action: None })
@@ -340,8 +277,8 @@ async fn add_user_handler(
     let expire_str = expire_date.naive_local();
 
     let query = "
-        INSERT INTO users (user_id, expire_date, who_added, Discord_tele_id, is_login, last_ping, expire, auto_lie, auto_lie_login)
-        VALUES (?, ?, ?, ?, 0, NOW(), 'no', 0, 0)
+        INSERT INTO users (user_id, expire_date, who_added, Discord_tele_id, last_ping, expire, auto_lie, auto_lie_login)
+        VALUES (?, ?, ?, ?, NOW(), 'no', 0, 0)
     ";
 
     let res = sqlx::query(query)
