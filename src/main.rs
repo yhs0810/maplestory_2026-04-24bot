@@ -84,7 +84,7 @@ async fn main() {
         .route("/api/logout", post(logout_handler))
         .route("/api/heartbeat", post(heartbeat_handler))
         .route("/api/add_user", post(add_user_handler))
-        .with_state(state);
+        .with_state(state.clone());
 
     // 0.0.0.0은 외부의 모든 웹 요청(유저 클라이언트 요청)을 허용한다는 뜻입니다.
     let idx = SocketAddr::from(([0, 0, 0, 0], 8080));
@@ -93,6 +93,18 @@ async fn main() {
         "🚀 Server API is successfully running and listening on {}",
         idx
     );
+    // 3. [NEW] 오프라인 사용자 자동 로그아웃 (60초 이상 핑 없는 경우)
+    let cleaner_pool = state.user_db.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        loop {
+            interval.tick().await;
+            let _ = sqlx::query("UPDATE users SET is_login = 0 WHERE is_login = 1 AND TIMESTAMPDIFF(SECOND, last_ping, NOW()) > 60")
+                .execute(&cleaner_pool)
+                .await;
+        }
+    });
+
     axum::serve(listener, app).await.unwrap();
 }
 
@@ -103,15 +115,19 @@ async fn login_handler(
 ) -> Json<LoginResponse> {
     let user_id = payload.user_id;
 
-    let user_res = sqlx::query("SELECT expire_date, is_login FROM users WHERE user_id = ?")
-        .bind(&user_id)
-        .fetch_optional(&state.user_db)
-        .await;
+    let user_res = sqlx::query(
+        "SELECT expire_date, is_login, auto_lie, auto_lie_login FROM users WHERE user_id = ?",
+    )
+    .bind(&user_id)
+    .fetch_optional(&state.user_db)
+    .await;
 
     match user_res {
         Ok(Some(row)) => {
             let is_login: i8 = row.get("is_login");
             let expire_date: chrono::NaiveDateTime = row.get("expire_date");
+            let auto_lie: i8 = row.get("auto_lie");
+            let auto_lie_login: i8 = row.get("auto_lie_login");
 
             let expire_edmonton = chrono_tz::America::Edmonton
                 .from_local_datetime(&expire_date)
@@ -129,8 +145,17 @@ async fn login_handler(
                 });
             }
 
-            // 중복 로그인 30초 핑 확인
-            if is_login != 0 {
+            // [NEW] auto_lie 가 1일 때만 사용 가능
+            if auto_lie == 0 {
+                return Json(LoginResponse {
+                    status: "error".to_string(),
+                    expire_date: None,
+                    message: Some("사용 권한이 없습니다 (auto_lie 비활성).".to_string()),
+                });
+            }
+
+            // [NEW] auto_lie_login 이 1일 경우에만 중복 로그인 막기
+            if auto_lie_login == 1 && is_login != 0 {
                 let seconds_since_last_ping: Option<i64> = sqlx::query_scalar::<_, Option<i64>>(
                     "SELECT TIMESTAMPDIFF(SECOND, last_ping, NOW()) FROM users WHERE user_id = ?",
                 )
@@ -207,16 +232,18 @@ async fn heartbeat_handler(
         .await;
 
     // 그 다음 상태가 정상적인지 판별해 클라이언트에 명령을 내립니다.
-    if let Ok(row) = sqlx::query("SELECT is_login, expire_date FROM users WHERE user_id = ?")
-        .bind(&user_id)
-        .fetch_one(&state.user_db)
-        .await
+    if let Ok(row) =
+        sqlx::query("SELECT is_login, expire_date, auto_lie FROM users WHERE user_id = ?")
+            .bind(&user_id)
+            .fetch_one(&state.user_db)
+            .await
     {
         let is_login: i8 = row.get("is_login");
         let expire_date: chrono::NaiveDateTime = row.get("expire_date");
+        let auto_lie: i8 = row.get("auto_lie");
 
-        // 만약 관리자가 DB에서 is_login을 0으로 바꿔서 강제로 끊었다면 'kick' 액션을 반환
-        if is_login == 0 {
+        // 만약 관리자가 DB에서 is_login 또는 auto_lie를 바꿔서 권한을 뺏었다면 'kick' 반환
+        if is_login == 0 || auto_lie == 0 {
             return Json(HeartbeatResponse {
                 action: Some("kick".to_string()),
             });
@@ -263,8 +290,8 @@ async fn add_user_handler(
 
     // SQL 실행: 새로 추가만 허용 (이미 있으면 에러 발생)
     let query = "
-        INSERT INTO users (user_id, expire_date, who_added, Discord_tele_id, is_login, last_ping)
-        VALUES (?, ?, ?, ?, 0, NOW())
+        INSERT INTO users (user_id, expire_date, who_added, Discord_tele_id, is_login, last_ping, expire)
+        VALUES (?, ?, ?, ?, 0, NOW(), 'no')
     ";
 
     let res = sqlx::query(query)
@@ -287,7 +314,7 @@ async fn add_user_handler(
             } else {
                 format!("사용자 추가 실패: {}", e)
             };
-            
+
             println!("DB Error (AddUser): {:?}", e);
             Json(AddUserResponse {
                 status: "error".to_string(),
