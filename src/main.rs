@@ -131,6 +131,8 @@ async fn login_handler(
 ) -> Json<LoginResponse> {
     let user_id = payload.user_id;
 
+    println!(">>> Login request from: {}, program: {:?}", user_id, payload.program);
+
     let user_res = sqlx::query(
         "SELECT expire_date, auto_lie, auto_lie_login, is_login FROM users WHERE user_id = ?",
     )
@@ -269,6 +271,8 @@ async fn heartbeat_handler(
 ) -> Json<HeartbeatResponse> {
     let user_id = payload.user_id;
     let is_auto_lie = payload.program.as_deref() == Some("auto_lie");
+
+    println!(">>> Heartbeat from: {}, program: {:?}", user_id, payload.program);
 
     // 핑 업데이트
     if is_auto_lie {
