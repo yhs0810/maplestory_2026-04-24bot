@@ -78,6 +78,11 @@ async fn main() {
         .await
         .expect("Failed to connect to Seller DB!");
 
+    // 데이터베이스 컬럼 자동 추가 (에러는 무시)
+    let _ = sqlx::query("ALTER TABLE users ADD COLUMN auto_lie_last_ping TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+        .execute(&user_pool)
+        .await;
+
     let state = AppState {
         user_db: user_pool,
         seller_db: seller_pool,
@@ -105,7 +110,7 @@ async fn main() {
         loop {
             interval.tick().await;
             // auto_lie_login 정리 (프로그램1)
-            let _ = sqlx::query("UPDATE users SET auto_lie_login = 0 WHERE auto_lie_login = 1 AND TIMESTAMPDIFF(SECOND, last_ping, NOW()) > 60")
+            let _ = sqlx::query("UPDATE users SET auto_lie_login = 0 WHERE auto_lie_login = 1 AND TIMESTAMPDIFF(SECOND, auto_lie_last_ping, NOW()) > 60")
                 .execute(&cleaner_pool).await;
 
             // is_login 정리 (프로그램2)
@@ -166,7 +171,7 @@ async fn login_handler(
 
                 if auto_lie_login != 0 {
                     let diff: i64 = sqlx::query_scalar(
-                        "SELECT TIMESTAMPDIFF(SECOND, last_ping, NOW()) FROM users WHERE user_id = ?",
+                        "SELECT TIMESTAMPDIFF(SECOND, auto_lie_last_ping, NOW()) FROM users WHERE user_id = ?",
                     )
                     .bind(&user_id)
                     .fetch_one(&state.user_db)
@@ -182,7 +187,7 @@ async fn login_handler(
                 }
 
                 let _ = sqlx::query(
-                    "UPDATE users SET auto_lie_login = 1, last_ping = NOW() WHERE user_id = ?",
+                    "UPDATE users SET auto_lie_login = 1, auto_lie_last_ping = NOW() WHERE user_id = ?",
                 )
                 .bind(&user_id)
                 .execute(&state.user_db)
@@ -266,7 +271,7 @@ async fn heartbeat_handler(
     // 핑 업데이트
     if is_auto_lie {
         let _ = sqlx::query(
-            "UPDATE users SET last_ping = NOW() WHERE user_id = ? AND auto_lie_login = 1",
+            "UPDATE users SET auto_lie_last_ping = NOW() WHERE user_id = ? AND auto_lie_login = 1",
         )
         .bind(&user_id)
         .execute(&state.user_db)
