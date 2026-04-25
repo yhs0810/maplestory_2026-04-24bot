@@ -40,6 +40,12 @@ struct AddUserRequest {
     discord_tele_id: String,
 }
 
+#[derive(Deserialize)]
+struct UpdateAutoLieRequest {
+    user_id: String,
+    enable: i8,
+}
+
 #[derive(Serialize)]
 struct AddUserResponse {
     status: String,
@@ -84,6 +90,7 @@ async fn main() {
         .route("/api/logout", post(logout_handler))
         .route("/api/heartbeat", post(heartbeat_handler))
         .route("/api/add_user", post(add_user_handler))
+        .route("/api/update_auto_lie", post(update_auto_lie_handler))
         .with_state(state.clone());
 
     // 0.0.0.0은 외부의 모든 웹 요청(유저 클라이언트 요청)을 허용한다는 뜻입니다.
@@ -99,7 +106,8 @@ async fn main() {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
         loop {
             interval.tick().await;
-            let _ = sqlx::query("UPDATE users SET is_login = 0 WHERE is_login = 1 AND TIMESTAMPDIFF(SECOND, last_ping, NOW()) > 60")
+            // auto_lie_login을 0으로 초기화 (60초 이상 무응답 시)
+            let _ = sqlx::query("UPDATE users SET auto_lie_login = 0 WHERE auto_lie_login = 1 AND TIMESTAMPDIFF(SECOND, last_ping, NOW()) > 60")
                 .execute(&cleaner_pool)
                 .await;
         }
@@ -154,33 +162,37 @@ async fn login_handler(
                 });
             }
 
-            // [NEW] auto_lie_login 이 1일 경우에만 중복 로그인 막기
-            if auto_lie_login == 1 && is_login != 0 {
+            // [NEW] 중복 로그인 체크 (auto_lie_login 사용)
+            // 만약 이미 로그인 중(1)이라면, 마지막 핑 시간을 확인
+            if auto_lie_login == 1 {
                 let seconds_since_last_ping: Option<i64> = sqlx::query_scalar::<_, Option<i64>>(
                     "SELECT TIMESTAMPDIFF(SECOND, last_ping, NOW()) FROM users WHERE user_id = ?",
                 )
                 .bind(&user_id)
                 .fetch_one(&state.user_db)
                 .await
-                .unwrap_or(Some(0));
+                .unwrap_or(Some(999)); // 오류 시 차단 안 함
 
                 if let Some(diff) = seconds_since_last_ping {
+                    // 30초 이내에 핑이 있었다면 진짜 중복 로그인으로 판단하고 차단
                     if diff < 30 {
                         return Json(LoginResponse {
                             status: "error".to_string(),
                             expire_date: None,
-                            message: Some("이미 로그인된 사용자입니다.".to_string()),
+                            message: Some("이미 다른 기기에서 사용 중입니다.".to_string()),
                         });
                     }
+                    // 30초 이상 지났다면 '갑자기 종료'된 것으로 간주하고 로그인을 허용함 (자동 재로그인 지원)
                 }
             }
 
-            // 모든 검증 통과 -> 로그인 상태 업데이트
-            let _ =
-                sqlx::query("UPDATE users SET is_login = 1, last_ping = NOW() WHERE user_id = ?")
-                    .bind(&user_id)
-                    .execute(&state.user_db)
-                    .await;
+            // 모든 검증 통과 -> 로그인 상태(auto_lie_login) 업데이트
+            let _ = sqlx::query(
+                "UPDATE users SET auto_lie_login = 1, last_ping = NOW() WHERE user_id = ?",
+            )
+            .bind(&user_id)
+            .execute(&state.user_db)
+            .await;
 
             return Json(LoginResponse {
                 status: "ok".to_string(),
@@ -210,7 +222,7 @@ async fn logout_handler(
     State(state): State<AppState>,
     Json(payload): Json<BasicRequest>,
 ) -> Json<serde_json::Value> {
-    let _ = sqlx::query("UPDATE users SET is_login = 0 WHERE user_id = ?")
+    let _ = sqlx::query("UPDATE users SET auto_lie_login = 0 WHERE user_id = ?")
         .bind(payload.user_id)
         .execute(&state.user_db)
         .await;
@@ -225,25 +237,26 @@ async fn heartbeat_handler(
 ) -> Json<HeartbeatResponse> {
     let user_id = payload.user_id;
 
-    // 우선 핑을 업데이트합니다.
-    let _ = sqlx::query("UPDATE users SET last_ping = NOW() WHERE user_id = ? AND is_login = 1")
-        .bind(&user_id)
-        .execute(&state.user_db)
-        .await;
+    // 우선 핑을 업데이트합니다. auto_lie_login이 1인 경우에만 업데이트
+    let _ =
+        sqlx::query("UPDATE users SET last_ping = NOW() WHERE user_id = ? AND auto_lie_login = 1")
+            .bind(&user_id)
+            .execute(&state.user_db)
+            .await;
 
     // 그 다음 상태가 정상적인지 판별해 클라이언트에 명령을 내립니다.
     if let Ok(row) =
-        sqlx::query("SELECT is_login, expire_date, auto_lie FROM users WHERE user_id = ?")
+        sqlx::query("SELECT auto_lie_login, expire_date, auto_lie FROM users WHERE user_id = ?")
             .bind(&user_id)
             .fetch_one(&state.user_db)
             .await
     {
-        let is_login: i8 = row.get("is_login");
+        let auto_lie_login: i8 = row.get("auto_lie_login");
         let expire_date: chrono::NaiveDateTime = row.get("expire_date");
         let auto_lie: i8 = row.get("auto_lie");
 
-        // 만약 관리자가 DB에서 is_login 또는 auto_lie를 바꿔서 권한을 뺏었다면 'kick' 반환
-        if is_login == 0 || auto_lie == 0 {
+        // 만약 관리자가 DB에서 auto_lie를 바꿔서 권한을 뺏었거나, 세션을 종료했다면 'kick' 반환
+        if auto_lie == 0 || auto_lie_login == 0 {
             return Json(HeartbeatResponse {
                 action: Some("kick".to_string()),
             });
@@ -258,10 +271,11 @@ async fn heartbeat_handler(
 
         // 사용 중간에 만료 기한이 지나버리면 DB도 끄고 킥 반환
         if current_time >= expire_edmonton {
-            let _ = sqlx::query("UPDATE users SET is_login = 0 WHERE user_id = ?")
-                .bind(&user_id)
-                .execute(&state.user_db)
-                .await;
+            let _ =
+                sqlx::query("UPDATE users SET is_login = 0, auto_lie_login = 0 WHERE user_id = ?")
+                    .bind(&user_id)
+                    .execute(&state.user_db)
+                    .await;
 
             return Json(HeartbeatResponse {
                 action: Some("kick".to_string()),
@@ -288,10 +302,10 @@ async fn add_user_handler(
     let expire_date = current_time + chrono::Duration::days(days as i64);
     let expire_str = expire_date.naive_local();
 
-    // SQL 실행: 새로 추가만 허용 (이미 있으면 에러 발생)
+    // SQL 실행: 새로 추가 (기본적으로 auto_lie = 0 권한 없음 상태로 추가)
     let query = "
-        INSERT INTO users (user_id, expire_date, who_added, Discord_tele_id, is_login, last_ping, expire)
-        VALUES (?, ?, ?, ?, 0, NOW(), 'no')
+        INSERT INTO users (user_id, expire_date, who_added, Discord_tele_id, is_login, last_ping, expire, auto_lie, auto_lie_login)
+        VALUES (?, ?, ?, ?, 0, NOW(), 'no', 0, 0)
     ";
 
     let res = sqlx::query(query)
@@ -319,6 +333,48 @@ async fn add_user_handler(
             Json(AddUserResponse {
                 status: "error".to_string(),
                 message: final_msg,
+            })
+        }
+    }
+}
+
+/// 5. [NEW] 특정 유저의 auto_lie 권한 활성화/비활성화
+async fn update_auto_lie_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<UpdateAutoLieRequest>,
+) -> Json<AddUserResponse> {
+    let res = sqlx::query("UPDATE users SET auto_lie = ? WHERE user_id = ?")
+        .bind(payload.enable)
+        .bind(&payload.user_id)
+        .execute(&state.seller_db)
+        .await;
+
+    match res {
+        Ok(result) => {
+            if result.rows_affected() == 0 {
+                return Json(AddUserResponse {
+                    status: "error".to_string(),
+                    message: format!("존재하지 않는 사용자입니다: {}", payload.user_id),
+                });
+            }
+            Json(AddUserResponse {
+                status: "ok".to_string(),
+                message: format!(
+                    "유저 [{}]의 auto_lie 권한이 '{}'으로 변경되었습니다.",
+                    payload.user_id,
+                    if payload.enable == 1 {
+                        "활성"
+                    } else {
+                        "비활성"
+                    }
+                ),
+            })
+        }
+        Err(e) => {
+            println!("DB Error (UpdateAutoLie): {:?}", e);
+            Json(AddUserResponse {
+                status: "error".to_string(),
+                message: format!("권한 변경 중 서버 오류 발생: {}", e),
             })
         }
     }
